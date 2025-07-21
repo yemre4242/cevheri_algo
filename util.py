@@ -1,8 +1,13 @@
 import string
 import easyocr
+import torch
+
+# Otomatik cihaz seçimi
+_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Initialize the OCR reader
-reader = easyocr.Reader(['en'], gpu=False)
+gpu_flag = True if _device == 'cuda' else False
+reader = easyocr.Reader(['en'], gpu=gpu_flag)
 
 # Mapping dictionaries for character conversion
 dict_char_to_int = {'O': '0',
@@ -35,26 +40,17 @@ def write_csv(results, output_path):
 
         for frame_nmr in results.keys():
             for car_id in results[frame_nmr].keys():
-                print(results[frame_nmr][car_id])
-                if 'car' in results[frame_nmr][car_id].keys() and \
-                   'license_plate' in results[frame_nmr][car_id].keys() and \
-                   'text' in results[frame_nmr][car_id]['license_plate'].keys():
-                    f.write('{},{},{},{},{},{},{}\n'.format(frame_nmr,
-                                                            car_id,
-                                                            '[{} {} {} {}]'.format(
-                                                                results[frame_nmr][car_id]['car']['bbox'][0],
-                                                                results[frame_nmr][car_id]['car']['bbox'][1],
-                                                                results[frame_nmr][car_id]['car']['bbox'][2],
-                                                                results[frame_nmr][car_id]['car']['bbox'][3]),
-                                                            '[{} {} {} {}]'.format(
-                                                                results[frame_nmr][car_id]['license_plate']['bbox'][0],
-                                                                results[frame_nmr][car_id]['license_plate']['bbox'][1],
-                                                                results[frame_nmr][car_id]['license_plate']['bbox'][2],
-                                                                results[frame_nmr][car_id]['license_plate']['bbox'][3]),
-                                                            results[frame_nmr][car_id]['license_plate']['bbox_score'],
-                                                            results[frame_nmr][car_id]['license_plate']['text'],
-                                                            results[frame_nmr][car_id]['license_plate']['text_score'])
-                            )
+                data = results[frame_nmr][car_id]
+                if 'car' in data and 'license_plate' in data and 'text' in data['license_plate']:
+                    f.write('{},{},{},{},{},{},{}\n'.format(
+                        frame_nmr,
+                        car_id,
+                        '[{} {} {} {}]'.format(*data['car']['bbox']),
+                        '[{} {} {} {}]'.format(*data['license_plate']['bbox']),
+                        data['license_plate']['bbox_score'],
+                        data['license_plate']['text'],
+                        data['license_plate']['text_score']
+                    ))
         f.close()
 
 

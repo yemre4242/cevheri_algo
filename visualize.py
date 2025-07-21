@@ -3,6 +3,9 @@ import ast
 import cv2
 import numpy as np
 import pandas as pd
+from ultralytics import YOLO
+import torch
+from sort.sort import Sort
 
 
 def draw_border(img, top_left, bottom_right, color=(0, 255, 0), thickness=10, line_length_x=200, line_length_y=200):
@@ -25,46 +28,25 @@ def draw_border(img, top_left, bottom_right, color=(0, 255, 0), thickness=10, li
 
 
 results = pd.read_csv('./test_interpolated.csv')
+guns_results = []
 
 # load video
-video_path = 'vid.mp4'  # Updated to match the actual file in the directory
-cap = cv2.VideoCapture(video_path)
+cap = cv2.VideoCapture(0)
 
-# Check if video file opened successfully
 if not cap.isOpened():
-    print(f"[ERROR] Could not open video file: {video_path}")
+    print("[ERROR] Kameraya erişilemiyor!")
     exit(1)
 
-# Print video information for debugging
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 fps = cap.get(cv2.CAP_PROP_FPS)
-print(f"Video loaded: {video_path} | Total frames: {total_frames} | FPS: {fps}")
+print(f"Kamera açıldı | FPS: {fps}")
 
-
-# Try different codecs - H.264 is more compatible on Windows
-try:
-    # First try H.264 codec
-    fourcc = cv2.VideoWriter_fourcc(*'H264')
-    output_path = './out.mp4'
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    
-    # Test if VideoWriter is initialized properly
-    if not out.isOpened():
-        # Fall back to XVID codec which has better compatibility
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        output_path = './out.avi'  # AVI container for XVID
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        if not out.isOpened():
-            raise Exception("Could not initialize video writer with any codec")
-        else:
-            print(f"Using XVID codec with output: {output_path}")
-    else:
-        print(f"Using H264 codec with output: {output_path}")
-except Exception as e:
-    print(f"Error setting up video writer: {e}")
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+output_path = './out.avi'
+out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+if not out.isOpened():
+    print("[ERROR] VideoWriter başlatılamadı!")
     cap.release()
     exit(1)
 
@@ -85,19 +67,28 @@ for car_id in np.unique(results['car_id']):
                                               (results['license_number_score'] == max_)]['license_plate_bbox'].iloc[0].replace('[ ', '[').replace('   ', ' ').replace('  ', ' ').replace(' ', ','))
 
     license_crop = frame[int(y1):int(y2), int(x1):int(x2), :]
-    license_crop = cv2.resize(license_crop, (int((x2 - x1) * 400 / (y2 - y1)), 400))
-
-    license_plate[car_id]['license_crop'] = license_crop
+    if license_crop is not None and license_crop.size > 0:
+        license_crop = cv2.resize(license_crop, (int((x2 - x1) * 400 / (y2 - y1)), 400))
+        license_plate[car_id]['license_crop'] = license_crop
+    else:
+        current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        print(f"[WARNING] Boş veya hatalı plaka crop: frame={current_frame}, car_id={car_id}")
+        continue  # veya pass
 
 
 frame_nmr = -1
 
-cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+# --- Silah tespiti için modeli başta yükle ---
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+gun_detector = YOLO('gun_deteckter.pt')
+gun_detector.to(device)
 
-# read frames
-ret = True
-while ret:
+gun_tracker = Sort(max_age=7)  # Silahlar için tracker, 7 kare boyunca görünmeyen silahlar silinir
+
+while True:
     ret, frame = cap.read()
+    if not ret:
+        break
     frame_nmr += 1
     if ret:
         df_ = results[results['frame_nmr'] == frame_nmr]
@@ -114,64 +105,89 @@ while ret:
             # crop license plate
             license_crop = license_plate[df_.iloc[row_indx]['car_id']]['license_crop']
 
-            H, W, _ = license_crop.shape
+            if license_crop is not None and license_crop.size > 0:
+                H, W, _ = license_crop.shape
 
-            try:
-                # Calculate target positions
-                y_start = max(0, int(car_y1) - H - 100)
-                y_end = max(0, int(car_y1) - 100)
-                x_start = max(0, int((car_x2 + car_x1 - W) / 2))
-                x_end = min(frame.shape[1], int((car_x2 + car_x1 + W) / 2))
-                
-                # Check if dimensions match before assignment
-                target_height = y_end - y_start
-                target_width = x_end - x_start
-                
-                if target_height > 0 and target_width > 0:
-                    # Resize license crop to match the target dimensions
-                    resized_crop = cv2.resize(license_crop, (target_width, target_height))
-                    # Overlay the license plate
-                    frame[y_start:y_end, x_start:x_end, :] = resized_crop
-                
-                # Calculate white background positions for text
-                bg_y_start = max(0, int(car_y1) - H - 400)
-                bg_y_end = max(0, int(car_y1) - H - 100)
-                bg_width = x_end - x_start
-                
-                if bg_y_end > bg_y_start and bg_width > 0:
-                    # Create white background of the correct size
-                    white_bg = np.ones((bg_y_end - bg_y_start, bg_width, 3), dtype=np.uint8) * 255
-                    # Overlay the white background
-                    frame[bg_y_start:bg_y_end, x_start:x_end, :] = white_bg
+                try:
+                    # Calculate target positions
+                    y_start = max(0, int(car_y1) - H - 100)
+                    y_end = max(0, int(car_y1) - 100)
+                    x_start = max(0, int((car_x2 + car_x1 - W) / 2))
+                    x_end = min(frame.shape[1], int((car_x2 + car_x1 + W) / 2))
+                    
+                    # Check if dimensions match before assignment
+                    target_height = y_end - y_start
+                    target_width = x_end - x_start
+                    
+                    if target_height > 0 and target_width > 0:
+                        # Resize license crop to match the target dimensions
+                        resized_crop = cv2.resize(license_crop, (target_width, target_height))
+                        # Overlay the license plate
+                        frame[y_start:y_end, x_start:x_end, :] = resized_crop
+                    
+                    # Calculate white background positions for text
+                    bg_y_start = max(0, int(car_y1) - H - 400)
+                    bg_y_end = max(0, int(car_y1) - H - 100)
+                    bg_width = x_end - x_start
+                    
+                    if bg_y_end > bg_y_start and bg_width > 0:
+                        # Create white background of the correct size
+                        white_bg = np.ones((bg_y_end - bg_y_start, bg_width, 3), dtype=np.uint8) * 255
+                        # Overlay the white background
+                        frame[bg_y_start:bg_y_end, x_start:x_end, :] = white_bg
 
-                (text_width, text_height), _ = cv2.getTextSize(
-                    license_plate[df_.iloc[row_indx]['car_id']]['license_plate_number'],
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    4.3,
-                    17)
+                    (text_width, text_height), _ = cv2.getTextSize(
+                        license_plate[df_.iloc[row_indx]['car_id']]['license_plate_number'],
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        4.3,
+                        17)
 
-                cv2.putText(frame,
-                            license_plate[df_.iloc[row_indx]['car_id']]['license_plate_number'],
-                            (int((car_x2 + car_x1 - text_width) / 2), int(car_y1 - H - 250 + (text_height / 2))),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            4.3,
-                            (0, 0, 0),
-                            17)
+                    cv2.putText(frame,
+                                license_plate[df_.iloc[row_indx]['car_id']]['license_plate_number'],
+                                (int((car_x2 + car_x1 - text_width) / 2), int(car_y1 - H - 250 + (text_height / 2))),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                4.3,
+                                (0, 0, 0),
+                                17)
 
-            except Exception as e:
-                print(f"Error processing license plate: {e}")
+                except Exception as e:
+                    print(f"Error processing license plate: {e}")
+            else:
+                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                print(f"[WARNING] Boş veya hatalı plaka crop: frame={current_frame}, car_id={car_id}")
+                continue
+
+        # --- Silah tespiti (sadece skor filtresi ile) ---
+        gun_detections = gun_detector(frame, device=device)[0]
+        gun_detections_ = []
+        for gun in gun_detections.boxes.data.tolist():
+            gx1, gy1, gx2, gy2, gscore, gclass_id = gun
+            if gscore >= 0.6:  # Eşiği yükselttik
+                gun_detections_.append([gx1, gy1, gx2, gy2, gscore])
+                # CSV için kaydet
+                guns_results.append({
+                    'frame_nmr': frame_nmr,
+                    'bbox': [gx1, gy1, gx2, gy2],
+                    'score': gscore,
+                    'class_id': gclass_id
+                })
+        # Takip (tracking)
+        if len(gun_detections_) > 0:
+            gun_tracks = gun_tracker.update(np.asarray(gun_detections_))
+            for track in gun_tracks:
+                x1, y1, x2, y2, gun_id = track
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                cv2.putText(frame, f'Gun ID: {int(gun_id)}', (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+                # İsterseniz CSV'ye de kaydedebilirsiniz
 
         # Write frame to output video
         try:
             out.write(frame)
-            # Resize for display (if needed)
+            # Ekranda göster
             frame_display = cv2.resize(frame, (1280, 720))
-            
-            # Uncomment to display frames while processing
-            # cv2.imshow('frame', frame_display)
-            # if cv2.waitKey(1) & 0xFF == ord('q'):
-            #     break
-            
+            cv2.imshow('Kamera', frame_display)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
         except Exception as e:
             print(f"Error writing frame: {e}")
 
@@ -180,6 +196,7 @@ try:
     # Properly release resources
     out.release()
     cap.release()
+    cv2.destroyAllWindows()
     print(f"Output video saved to: {output_path}")
 except Exception as e:
     print(f"Error during cleanup: {e}")
